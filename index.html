@@ -1,0 +1,174 @@
+const corsHeaders = (origin) => ({
+  "Access-Control-Allow-Origin": origin,
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Authorization",
+  "Access-Control-Max-Age": "86400",
+  "Vary": "Origin"
+});
+
+function json(data, status = 200, origin = "*") {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(origin) }
+  });
+}
+
+function publicUser(row) {
+  return {
+    id: row.id, fullName: row.full_name, username: row.username,
+    roleType: row.role_type, grade: row.grade, className: row.class_name,
+    status: row.status, banReason: row.ban_reason, points: row.points,
+    avatar: row.avatar, createdAt: row.created_at
+  };
+}
+
+const enc = new TextEncoder();
+const b64 = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)));
+const unb64 = (value) => Uint8Array.from(atob(value), c => c.charCodeAt(0));
+
+async function hashPassword(password, saltText) {
+  const salt = saltText ? unb64(saltText) : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 310000, hash: "SHA-256" }, key, 256);
+  return `pbkdf2$310000$${b64(salt)}$${b64(bits)}`;
+}
+
+async function verifyPassword(password, stored) {
+  const parts = stored.split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+  const salt = parts[2];
+  const expected = parts[3];
+  const actual = (await hashPassword(password, salt)).split("$")[3];
+  if (actual.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < actual.length; i++) diff |= actual.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
+}
+
+async function digest(value) {
+  return b64(await crypto.subtle.digest("SHA-256", enc.encode(value)));
+}
+
+function validUsername(value) {
+  return /^[a-z0-9_]{4,24}$/i.test(value);
+}
+
+async function createAdminIfNeeded(env) {
+  const username = (env.ADMIN_USERNAME || "admin").trim().toLowerCase();
+  const password = env.ADMIN_PASSWORD;
+  if (!password || password.length < 12) return;
+  const exists = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
+  if (!exists) {
+    const id = crypto.randomUUID();
+    const passwordHash = await hashPassword(password);
+    await env.DB.prepare(`INSERT INTO users
+      (id,full_name,username,password_hash,role_type,grade,class_name,status,points,avatar,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .bind(id, "Ban Quản Trị Tiểu La", username, passwordHash, "admin", "Ban Quản Trị", "Quản trị viên", "approved", 0,
+        `https://ui-avatars.com/api/?name=Admin&background=991B1B&color=fff&bold=true`, Date.now()).run();
+  }
+}
+
+async function getSessionUser(request, env) {
+  const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const tokenHash = await digest(token);
+  const row = await env.DB.prepare(`SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
+    WHERE s.token_hash=? AND s.expires_at>?`).bind(tokenHash, Date.now()).first();
+  return row || null;
+}
+
+export default {
+  async fetch(request, env) {
+    const origin = request.headers.get("Origin") || "";
+    const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(x => x.trim()).filter(Boolean);
+    if (request.method === "OPTIONS") {
+      if (!allowed.includes(origin)) return new Response("Origin not allowed", { status: 403 });
+      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+    }
+    if (!allowed.includes(origin)) return json({ error: "Origin không được phép." }, 403, origin || "*");
+    if (!env.DB) return json({ error: "Chưa kết nối Cloudflare D1." }, 500, origin);
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+    try {
+      if (request.method === "POST" && path === "/api/register") {
+        const body = await request.json();
+        const fullName = String(body.fullName || "").trim();
+        const username = String(body.username || "").trim().toLowerCase();
+        const password = String(body.password || "");
+        const grade = String(body.grade || "").trim();
+        const className = String(body.className || "").trim();
+        if (fullName.length < 2 || fullName.length > 80 || !validUsername(username) || password.length < 8 || password.length > 128 || !grade || !className)
+          return json({ error: "Thông tin chưa hợp lệ. Tên đăng nhập 4–24 ký tự, mật khẩu tối thiểu 8 ký tự." }, 400, origin);
+        const exists = await env.DB.prepare("SELECT id FROM users WHERE username=?").bind(username).first();
+        if (exists) return json({ error: "Tên đăng nhập đã được sử dụng." }, 409, origin);
+        const colors = ["1E40AF", "059669", "D97706", "7C3AED", "0284C7"];
+        const bg = colors[Math.floor(Math.random() * colors.length)];
+        const user = { id: crypto.randomUUID(), fullName, username, grade, className,
+          avatar: `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}&background=${bg}&color=fff&bold=true` };
+        const passwordHash = await hashPassword(password);
+        await env.DB.prepare(`INSERT INTO users
+          (id,full_name,username,password_hash,role_type,grade,class_name,status,points,avatar,created_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+          .bind(user.id, fullName, username, passwordHash, "member", grade, className, "pending", 10, user.avatar, Date.now()).run();
+        return json({ ok: true, message: "Đăng ký thành công. Tài khoản đang chờ Admin phê duyệt." }, 201, origin);
+      }
+
+      if (request.method === "POST" && path === "/api/login") {
+        await createAdminIfNeeded(env);
+        const body = await request.json();
+        const username = String(body.username || "").trim().toLowerCase();
+        const password = String(body.password || "");
+        const row = await env.DB.prepare("SELECT * FROM users WHERE username=?").bind(username).first();
+        if (!row || !(await verifyPassword(password, row.password_hash))) return json({ error: "Tên đăng nhập hoặc mật khẩu không chính xác." }, 401, origin);
+        if (row.status === "pending") return json({ error: "Tài khoản đang chờ Admin phê duyệt." }, 403, origin);
+        if (row.status === "banned") return json({ error: `Tài khoản đã bị khóa. Lý do: ${row.ban_reason || "Liên hệ Ban Quản Trị."}` }, 403, origin);
+        const token = b64(crypto.getRandomValues(new Uint8Array(32)));
+        await env.DB.prepare("INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)")
+          .bind(await digest(token), row.id, Date.now() + 7 * 86400000, Date.now()).run();
+        return json({ ok: true, token, user: publicUser(row) }, 200, origin);
+      }
+
+      if (request.method === "POST" && path === "/api/logout") {
+        const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+        if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await digest(token)).run();
+        return json({ ok: true }, 200, origin);
+      }
+
+      if (request.method === "GET" && path === "/api/me") {
+        const user = await getSessionUser(request, env);
+        if (!user || user.status !== "approved") return json({ user: null }, 200, origin);
+        return json({ user: publicUser(user) }, 200, origin);
+      }
+
+      if (path.startsWith("/api/admin/") && request.method === "GET") {
+        const admin = await getSessionUser(request, env);
+        if (!admin || admin.role_type !== "admin") return json({ error: "Không có quyền quản trị." }, 403, origin);
+        if (path === "/api/admin/users") {
+          const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY created_at DESC").all();
+          return json({ users: results.map(publicUser) }, 200, origin);
+        }
+      }
+
+      if (request.method === "POST" && path.startsWith("/api/admin/users/")) {
+        const admin = await getSessionUser(request, env);
+        if (!admin || admin.role_type !== "admin") return json({ error: "Không có quyền quản trị." }, 403, origin);
+        const parts = path.split("/");
+        const userId = parts[4];
+        const action = parts[5];
+        if (!["approve", "reject"].includes(action)) return json({ error: "Thao tác không hợp lệ." }, 404, origin);
+        if (action === "approve") {
+          await env.DB.prepare("UPDATE users SET status='approved' WHERE id=? AND role_type='member'").bind(userId).run();
+        } else {
+          await env.DB.prepare("DELETE FROM users WHERE id=? AND role_type='member' AND status='pending'").bind(userId).run();
+        }
+        return json({ ok: true }, 200, origin);
+      }
+
+      return json({ error: "Không tìm thấy API." }, 404, origin);
+    } catch (error) {
+      return json({ error: "Lỗi máy chủ. Vui lòng thử lại.", detail: env.ENVIRONMENT === "development" ? String(error) : undefined }, 500, origin);
+    }
+  }
+};
